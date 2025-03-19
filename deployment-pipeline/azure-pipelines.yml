@@ -1,0 +1,261 @@
+trigger:
+  branches:
+    include:
+      - develop
+      - feature/*
+      - main
+
+parameters:
+  - name: triggeredFromArgoCD
+    type: boolean
+    default: false
+
+variables:
+  GIT_USER: "service-account"
+  GIT_EMAIL: "service-account@example.com"
+  GIT_REPO: "https://$(GIT_SERVICE_TOKEN)@github.com/my-org/my-repo.git" # Using PAT in URL
+
+stages:
+  - stage: ArgoCDTriggered
+    condition: eq(${{ parameters.triggeredFromArgoCD }}, true)
+    jobs:
+      - job: Git_Fetch_And_Integration_Test
+        displayName: "Git Fetch & Run Integration Tests"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - script: |
+              mvn clean verify
+            displayName: "Run Integration Tests"
+
+      - job: Update_Helm_Values_And_Create_PR
+        displayName: "Update Helm Values & Raise PR"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+            persistCredentials: true # Needed to push changes back to repo
+          - script: |
+              git config --global user.name "$(GIT_USER)"
+              git config --global user.email "$(GIT_EMAIL)
+
+              git checkout develop
+              git pull origin develop
+
+              # Update image tag in values-prod.yaml
+              sed -i 's/imageTag:.*/imageTag: "$(Build.BuildId)"/' charts/my-app/values-prod.yaml
+
+              git add charts/my-app/values-prod.yaml
+              git commit -m "Updated image tag to $(Build.BuildId) in values-prod.yaml"
+              git push origin develop
+
+            displayName: "Update values-prod.yaml with BuildID"
+
+          - script: |
+              curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $(System.AccessToken)" \
+                -d '{
+                  "sourceRefName": "refs/heads/develop",
+                  "targetRefName": "refs/heads/main",
+                  "title": "Auto PR: Merge Develop into Main",
+                  "description": "Automatically created PR with updated values-prod.yaml image tag.",
+                  "reviewers": [{"id": "user@myorg.com"}]  # Add reviewers if needed
+                }' \
+                https://dev.azure.com/<ORG>/<PROJECT>/_apis/git/repositories/<REPO_ID>/pullrequests?api-version=6.0
+            displayName: "Create PR from Develop to Main"
+
+  - stage: JS Lint
+    condition: eq(${{ parameters.triggeredFromArgoCD }}, false)
+    dependsOn: []
+    jobs:
+      - job: Lint_JavaScript
+        displayName: "Lint JavaScript"
+        container: node:20
+        steps:
+          - checkout: self
+          - script: |
+              npm install
+              npm run lint
+            displayName: "Run JavaScript Lint"
+
+  - stage: Helm Lint and Push
+    displayName: "Helm Lint, Validate & Push"
+    jobs:
+      - job: Helm_Lint
+        displayName: "Helm Lint"
+        container: alpine/k8s:1.27.3
+        steps:
+          - checkout: self
+          - script: |
+              helm lint charts/my-app
+            displayName: "Helm Lint"
+
+      - job: Pluto_Check
+        displayName: "Run Pluto for Deprecation Detection"
+        pool:
+          container: ghcr.io/fairwindsops/pluto:latest # Use Pluto Docker image
+        steps:
+          - checkout: self
+
+          # Fetch current Kubernetes and Cert-Manager versions
+          - script: |
+              K8S_VERSION=$(kubectl version --short --client | awk -Fv '{print $2}')
+              CERT_MANAGER_VERSION=$(kubectl get deployment -n cert-manager cert-manager -o jsonpath='{.spec.template.spec.containers[0].image}' | awk -F: '{print $2}')
+
+              echo "Using Kubernetes Version: $K8S_VERSION"
+              echo "Using Cert-Manager Version: $CERT_MANAGER_VERSION"
+
+              # Run Pluto to detect deprecated API usage
+              pluto detect-files -d charts/my-app --k8s-version $K8S_VERSION
+
+              # Run Pluto to check Cert-Manager version compatibility
+              pluto detect-files -d charts/my-app --k8s-version $CERT_MANAGER_VERSION
+            displayName: "Pluto Deprecation Check"
+
+      - job: Helm_Template
+        displayName: "Helm Lint"
+        container: alpine/k8s:1.27.3
+        steps:
+          - checkout: self
+          - script: |
+              helm template charts/my-app
+            displayName: "Helm Template Validation"
+
+      - job: Helm_Publish_Chart
+        displayName: "Helm Lint"
+        container: alpine/k8s:1.27.3
+        steps:
+          - checkout: self
+          - script: |
+              helm package charts/my-app
+              helm push my-app-*.tgz oci://myhelmrepo.azurecr.io
+            displayName: "Helm Chart Publish"
+
+  - stage: OWASP Sonarqube and Build
+    displayName: "Security Scan & Build"
+    jobs:
+      - job: OWASP_Scan
+        displayName: "Run OWASP Scan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+
+          # Run OWASP Dependency-Check for a Java Project
+          - script: |
+              mkdir owasp-report
+              curl -LO https://github.com/jeremylong/DependencyCheck/releases/download/v9.0.9/dependency-check-9.0.9-release.zip
+              unzip dependency-check-9.0.9-release.zip
+              dependency-check/bin/dependency-check.sh --scan $(Build.SourcesDirectory) --format HTML --out $(Build.ArtifactStagingDirectory)/owasp-report
+
+              # Extract high-severity CVEs from JSON report
+              HIGH_CVE_COUNT=$(jq '[.dependencies[].vulnerabilities[] | select(.severity=="High")] | length' $(Build.ArtifactStagingDirectory)/owasp-report/dependency-check-report.json)
+
+              echo "High Severity CVE Count: $HIGH_CVE_COUNT"
+
+              # Fail pipeline if high-severity CVEs are found
+              if [ "$HIGH_CVE_COUNT" -gt 0 ]; then
+                echo "Pipeline failed due to high-severity vulnerabilities!"
+                exit 1
+              fi
+            displayName: "Run OWASP Dependency-Check & Fail on High CVEs"
+
+          # Publish OWASP Dependency-Check Report
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(Build.ArtifactStagingDirectory)/owasp-report"
+              artifactName: "OWASP_Report"
+            displayName: "Publish OWASP Report"
+
+      - job: SonarQube_Analysis
+        displayName: "SonarQube Analysis"
+        container: maven:3.8.6-openjdk-17
+        steps:
+          - checkout: self
+
+          # Retrieve SonarQube credentials from Azure Key Vault
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: "AzureServiceConnection"
+              KeyVaultName: "MyKeyVault"
+              SecretsFilter: "SonarQubeToken"
+              runAsPreJob: true
+            displayName: "Fetch SonarQube Credentials"
+
+          - task: SonarQubePrepare@5
+            inputs:
+              SonarQube: "SonarQubeServiceConnection"
+              scannerMode: "CLI"
+              configMode: "manual"
+              extraProperties: |
+                sonar.projectKey=my-project
+                sonar.projectName=MyProject
+                sonar.sources=src
+                sonar.java.binaries=target/classes
+                sonar.login=$(SonarQubeToken)  # Use Key Vault secret
+            displayName: "Prepare SonarQube"
+
+          - script: |
+              mvn clean test -Psonar sonar:sonar
+            displayName: "Run Unit Tests & SonarQube Analysis"
+
+      - job: Build_And_Push
+        displayName: "Build & Push Docker Image"
+        container: maven:3.8.6-openjdk-17
+        steps:
+          - checkout: self
+
+          # Retrieve ACR credentials from Azure Key Vault
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: "AzureServiceConnection"
+              KeyVaultName: "MyKeyVault"
+              SecretsFilter: "ACR-Username,ACR-Password"
+              runAsPreJob: true
+            displayName: "Fetch ACR Credentials"
+
+          - script: |
+              echo $(ACR-Password) | docker login myacr.azurecr.io -u $(ACR-Username) --password-stdin
+            displayName: "Login to Azure Container Registry"
+
+          - script: |
+              docker build -t myacr.azurecr.io/my-app:$(Build.BuildId) .
+              docker push myacr.azurecr.io/my-app:$(Build.BuildId)
+            displayName: "Build & Push Docker Image"
+
+  - stage: Update_Helm_Values_Develop
+    displayName: "Update Helm Values (Only for Develop)"
+    condition: eq(variables['Build.SourceBranchName'], 'develop')
+    jobs:
+      - job: Update_Helm_Values_Develop
+        displayName: "Update Helm Values (Only for Develop)"
+        condition: eq(variables['Build.SourceBranchName'], 'develop')
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+          - script: |
+              git config --global user.name "$(GIT_USER)"
+              git config --global user.email "$(GIT_EMAIL)"
+              git remote set-url origin $(GIT_REPO)
+
+              sed -i 's/imageTag:.*/imageTag: "$(Build.BuildId)"/' charts/my-app/values-non-prod.yaml
+
+              git add charts/my-app/values-non-prod.yaml
+              git commit -m "Updated image tag to $(Build.BuildId)"
+              git push origin develop
+
+  - stage: Cleanup Workspace
+    displayName: "Clean Workspace"
+    jobs:
+      - job: Cleanup_Workspace
+        displayName: "Cleanup Build Agent"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - script: |
+              echo "Cleaning up workspace..."
+              rm -rf $(Build.SourcesDirectory)/*
+            displayName: "Remove Workspace Files"
