@@ -61,3 +61,7 @@ The diagram below illustrates how the CI/CD pipelines interact with the AKS clus
 
 - For other non-prod environments, update the corresponding `values-<env>.yaml` file with the BuildID.
 - ArgoCD will detect changes in the respective values file and trigger deployment to the appropriate environment.
+
+## 3. Supporting Code Samples
+
+A sample deployment pipeline is located in the [deployment-pipeline](./deployment-pipeline/) directory. This pipeline demonstrates various stages of the deployment process, as outlined above.
